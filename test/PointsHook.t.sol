@@ -16,6 +16,7 @@ import {PoolId} from "v4-core/types/PoolId.sol";
 
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {Position} from "v4-core/libraries/Position.sol";
 import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 
@@ -47,7 +48,9 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
 
         // Deploy hook to an address that has the proper flags set
         uint160 flags = uint160(
-            Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+            Hooks.AFTER_SWAP_FLAG |
+                Hooks.AFTER_ADD_LIQUIDITY_FLAG |
+                Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
         );
         deployCodeTo("PointsHook.sol", abi.encode(manager), address(flags));
 
@@ -166,5 +169,147 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
 
         assertGt(ethSpent, 0);
         assertEq(hook.balanceOf(address(this), poolIdUint), pointsBefore);
+    }
+
+    // ---------------------------------------------------------------
+    // Remove-liquidity burn
+    // ---------------------------------------------------------------
+
+    // A fresh salt keeps these positions separate from the setUp liquidity
+    bytes32 constant SALT = bytes32(uint256(1));
+    address constant ALICE = address(0xA11CE);
+
+    function _poolIdUint() internal view returns (uint256) {
+        return uint256(PoolId.unwrap(key.toId()));
+    }
+
+    function _modify(int256 liquidityDelta, bytes memory hookData) internal {
+        modifyLiquidityRouter.modifyLiquidity{
+            value: liquidityDelta > 0 ? 0.1 ether : 0
+        }(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: liquidityDelta,
+                salt: SALT
+            }),
+            hookData
+        );
+    }
+
+    function test_removeLiquidity_full_burnsAllLpPoints() public {
+        _modify(1 ether, abi.encode(address(this)));
+        assertGt(hook.balanceOf(address(this), _poolIdUint()), 0);
+
+        // No hookData on removal: the LP can't dodge the burn by omitting it
+        _modify(-1 ether, ZERO_BYTES);
+
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), 0);
+        (address owner, uint128 liq, uint256 pts) = hook.lpRecords(key.toId(), _posKey());
+        assertEq(owner, address(0));
+        assertEq(liq, 0);
+        assertEq(pts, 0);
+    }
+
+    function test_removeLiquidity_partial_burnsProportionally() public {
+        _modify(1 ether, abi.encode(address(this)));
+        uint256 earned = hook.balanceOf(address(this), _poolIdUint());
+
+        _modify(-0.25 ether, ZERO_BYTES);
+
+        uint256 expectedBurn = earned / 4;
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), earned - expectedBurn);
+        (, uint128 liq, uint256 pts) = hook.lpRecords(key.toId(), _posKey());
+        assertEq(liq, 0.75 ether);
+        assertEq(pts, earned - expectedBurn);
+    }
+
+    function test_removeLiquidity_keepsSwapPoints() public {
+        // Earn swap points and LP points, then exit the LP position
+        swapRouter.swap{value: 0.001 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.001 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(address(this))
+        );
+        uint256 swapPoints = hook.balanceOf(address(this), _poolIdUint());
+
+        _modify(1 ether, abi.encode(address(this)));
+        _modify(-1 ether, ZERO_BYTES);
+
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), swapPoints);
+    }
+
+    function test_removeLiquidity_cannotBurnSomeoneElsesPoints() public {
+        // Alice earns swap points
+        swapRouter.swap{value: 0.001 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.001 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(ALICE)
+        );
+        uint256 alicePoints = hook.balanceOf(ALICE, _poolIdUint());
+        assertGt(alicePoints, 0);
+
+        // We add and remove our own liquidity, naming Alice on removal
+        _modify(1 ether, abi.encode(address(this)));
+        _modify(-1 ether, abi.encode(ALICE));
+
+        assertEq(hook.balanceOf(ALICE, _poolIdUint()), alicePoints);
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), 0);
+    }
+
+    function test_addLiquidity_secondRecipientOnSamePosition_noPoints() public {
+        _modify(1 ether, abi.encode(address(this)));
+        _modify(1 ether, abi.encode(ALICE));
+
+        assertEq(hook.balanceOf(ALICE, _poolIdUint()), 0);
+    }
+
+    function test_removeLiquidity_afterTransferringPoints_doesNotRevert() public {
+        _modify(1 ether, abi.encode(address(this)));
+        uint256 earned = hook.balanceOf(address(this), _poolIdUint());
+
+        // Move most points away before withdrawing
+        hook.safeTransferFrom(address(this), ALICE, _poolIdUint(), earned - 1, "");
+
+        _modify(-1 ether, ZERO_BYTES);
+
+        // Burn is capped at what's left; withdrawal still succeeds
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), 0);
+        assertEq(hook.balanceOf(ALICE, _poolIdUint()), earned - 1);
+    }
+
+    function test_removeLiquidity_untrackedPosition_noBurn() public {
+        // Liquidity added with no recipient never earned points, so removal burns nothing
+        _modify(1 ether, abi.encode(address(this)));
+        uint256 earned = hook.balanceOf(address(this), _poolIdUint());
+
+        // Remove from the setUp position (salt 0), which never earned points
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -0.5 ether,
+                salt: bytes32(0)
+            }),
+            abi.encode(address(this))
+        );
+
+        assertEq(hook.balanceOf(address(this), _poolIdUint()), earned);
+    }
+
+    function _posKey() internal view returns (bytes32) {
+        return Position.calculatePositionKey(address(modifyLiquidityRouter), -60, 60, SALT);
     }
 }
