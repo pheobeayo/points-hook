@@ -29,7 +29,7 @@ contract PointsHook is BaseHook, ERC1155 {
                 afterInitialize: false,
                 beforeAddLiquidity: false,
                 beforeRemoveLiquidity: false,
-                afterAddLiquidity: false,
+                afterAddLiquidity: true,
                 afterRemoveLiquidity: false,
                 beforeSwap: false,
                 afterSwap: true,
@@ -75,6 +75,35 @@ contract PointsHook is BaseHook, ERC1155 {
         _assignPoints(key.toId(), hookData, pointsForSwap);
 
         return (this.afterSwap.selector, 0);
+    }
+
+    /// @notice Reward liquidity providers with points worth 10% of the ETH they deposit.
+    /// @dev `delta` is the caller's delta, which includes any fees collected from an
+    ///      existing position. Subtracting `feesAccrued` leaves only the principal,
+    ///      so topping up a position can't farm points from collected fees.
+    function _afterAddLiquidity(
+        address,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bytes calldata hookData
+    ) internal override returns (bytes4, BalanceDelta) {
+        // Only ETH-TOKEN pools earn points
+        if (!key.currency0.isAddressZero()) {
+            return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
+        }
+
+        // Adding liquidity makes amount0 negative (ETH flows into the pool)
+        int128 principal0 = (delta - feesAccrued).amount0();
+        if (principal0 >= 0) {
+            return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
+        }
+
+        uint256 ethAdded = uint256(int256(-principal0));
+        _assignPoints(key.toId(), hookData, ethAdded / 10);
+
+        return (this.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
 
     function _assignPoints(

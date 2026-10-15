@@ -46,7 +46,9 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
         token.mint(address(1), 1000 ether);
 
         // Deploy hook to an address that has the proper flags set
-        uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
+        uint160 flags = uint160(
+            Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+        );
         deployCodeTo("PointsHook.sol", abi.encode(manager), address(flags));
 
         // Deploy our hook
@@ -126,5 +128,43 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
             poolIdUint
         );
         assertEq(pointsBalanceAfterSwap - pointsBalanceOriginal, 2 * 10 ** 14);
+    }
+
+    function _addLiquidity(bytes memory hookData) internal returns (uint256 ethSpent) {
+        uint256 ethBefore = address(this).balance;
+        modifyLiquidityRouter.modifyLiquidity{value: 0.1 ether}(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 1 ether,
+                salt: bytes32(0)
+            }),
+            hookData
+        );
+        ethSpent = ethBefore - address(this).balance;
+    }
+
+    function test_addLiquidity_mintsPoints() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        uint256 ethSpent = _addLiquidity(abi.encode(address(this)));
+
+        assertGt(ethSpent, 0);
+        assertEq(
+            hook.balanceOf(address(this), poolIdUint) - pointsBefore,
+            ethSpent / 10
+        );
+    }
+
+    function test_addLiquidity_noHookData_noPoints() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        uint256 ethSpent = _addLiquidity(ZERO_BYTES);
+
+        assertGt(ethSpent, 0);
+        assertEq(hook.balanceOf(address(this), poolIdUint), pointsBefore);
     }
 }
